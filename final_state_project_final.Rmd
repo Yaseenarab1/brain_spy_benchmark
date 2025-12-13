@@ -1,0 +1,1644 @@
+
+---
+
+# 📘 **CCC_ANALYSIS_STEP1to5.Rmd**
+
+---
+title: "CCC Analysis — Steps 1 to 5"
+author: "Yaseen"
+output: html_document
+---
+
+############################################################
+# STEP 0 — Load Libraries
+############################################################
+
+
+```{r}
+install.packages(c(
+  "Seurat",
+  "Matrix",
+  "Rcpp",
+  "RcppArmadillo",
+  "tidyverse",
+  "patchwork",
+  "NMF",
+  "devtools"
+), dependencies = TRUE)
+
+install.packages("BiocManager")
+BiocManager::install(c(
+  "celldex",
+  "SingleR",
+  "SingleCellExperiment",
+  "SummarizedExperiment",
+  "nichenetr"
+))
+BiocManager::install("ComplexHeatmap")
+devtools::install_github("jinworks/CellChat")
+BiocManager::install(c(
+  "DESeq2",
+  "edgeR",
+  "scater"
+))
+
+BiocManager::install(c(
+  "Biostrings",
+  "SummarizedExperiment",
+  "SingleCellExperiment",
+  "data.table"
+))
+
+install.packages("Rcpp", dependencies = TRUE)
+install.packages("BH", dependencies = TRUE)
+install.packages("bayesm", dependencies = TRUE)
+install.packages("mvtnorm", dependencies = TRUE)
+BiocManager::install("SingleCellSignalR")
+
+```
+
+```{r}
+library(Seurat)
+library(patchwork)
+library(NMF)
+library(SingleCellSignalR)
+library(zellkonverter)
+library(tidyverse)
+library(Matrix)
+library(SingleCellExperiment)
+library(SingleR)
+library(celldex)
+library(data.table)
+library(googledrive)
+library(CellChat)
+library(methods)  
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+
+```
+
+
+
+```{r}
+install.packages("googledrive")
+drive_auth(scopes = "https://www.googleapis.com/auth/drive")
+drive_ls("~/state_project/data/anndata")
+```
+
+
+```{r}
+raw_dir <- "~/Downloads/GSE174554_RAW"  
+stopifnot(dir.exists(raw_dir))
+length(list.files(raw_dir))
+```
+
+############################################################
+# STEP 1 — download the data, merge, read the files 
+############################################################
+
+```{r}
+files <- list.files(raw_dir, full.names = TRUE)
+
+strip_suffix <- function(x) sub("_(matrix\\.mtx\\.gz|features\\.tsv\\.gz|barcodes\\.tsv\\.gz)$", "", x)
+
+mtx <- files[grepl("_matrix\\.mtx\\.gz$", files)]
+feat <- files[grepl("_features\\.tsv\\.gz$", files)]
+bar <- files[grepl("_barcodes\\.tsv\\.gz$", files)]
+
+prefix_mtx <- strip_suffix(basename(mtx))
+prefix_feat <- strip_suffix(basename(feat))
+prefix_bar <- strip_suffix(basename(bar))
+
+common_prefix <- Reduce(intersect, list(prefix_mtx, prefix_feat, prefix_bar))
+length(common_prefix)
+head(common_prefix, 10)
+
+```
+
+
+```{r}
+read_one_10x_triplet_safe <- function(prefix, raw_dir) {
+  tryCatch({
+    mtx_path  <- file.path(raw_dir, paste0(prefix, "_matrix.mtx.gz"))
+    feat_path <- file.path(raw_dir, paste0(prefix, "_features.tsv.gz"))
+    bar_path  <- file.path(raw_dir, paste0(prefix, "_barcodes.tsv.gz"))
+
+    feat_preview <- data.table::fread(
+      cmd = paste("zcat", shQuote(feat_path), "| head -n 5"),
+      header = FALSE, data.table = FALSE
+    )
+    feature_col <- if (ncol(feat_preview) >= 2) 2 else 1
+
+    mat <- ReadMtx(
+      mtx = mtx_path,
+      features = feat_path,
+      cells = bar_path,
+      feature.column = feature_col
+    )
+
+    obj <- CreateSeuratObject(mat, project = prefix, min.cells = 0, min.features = 0)
+    obj$sample_id <- prefix
+    obj
+  }, error = function(e) {
+    message("Skipping sample (failed to load): ", prefix, "  |  reason: ", conditionMessage(e))
+    return(NULL)
+  })
+}
+
+seurat_list <- lapply(common_prefix, read_one_10x_triplet_safe, raw_dir = raw_dir)
+names(seurat_list) <- common_prefix
+
+ok <- !vapply(seurat_list, is.null, logical(1))
+failed_samples <- names(seurat_list)[!ok]
+seurat_list <- seurat_list[ok]
+
+cat("Loaded samples:", length(seurat_list), "\n")
+cat("Failed samples:", length(failed_samples), "\n")
+if (length(failed_samples) > 0) print(failed_samples)
+
+seurat_list[[1]]
+```
+
+
+############################################################
+# STEP 2 — filtering and pre-prossing  
+############################################################
+
+
+```{r}
+min_genes <- 200
+max_genes <- 6000
+max_mt    <- 15
+min_cells_per_gene <- 5
+
+for (i in seq_along(seurat_list)) {
+  seurat_list[[i]][["percent.mt"]] <- PercentageFeatureSet(seurat_list[[i]], pattern = "^MT-")
+  seurat_list[[i]] <- subset(
+    seurat_list[[i]],
+    subset = nFeature_RNA >= min_genes &
+             nFeature_RNA <= max_genes &
+             percent.mt <= max_mt
+  )
+
+  counts <- GetAssayData(seurat_list[[i]], layer = "counts")
+  keep_genes <- Matrix::rowSums(counts > 0) >= min_cells_per_gene
+  seurat_list[[i]] <- seurat_list[[i]][keep_genes, ]
+}
+
+tibble(
+  sample_id = names(seurat_list),
+  n_cells = vapply(seurat_list, ncol, numeric(1)),
+  n_genes = vapply(seurat_list, nrow, numeric(1))
+) %>% arrange(desc(n_cells))
+
+```
+
+```{r}
+set.seed(42)
+
+max_cells_per_sample <- 100000
+
+seurat_list <- Map(function(obj, sid) {
+  n <- ncol(obj)
+  if (n > max_cells_per_sample) {
+    keep <- sample(colnames(obj), max_cells_per_sample)
+    obj <- subset(obj, cells = keep)
+  }
+
+  obj <- RenameCells(obj, add.cell.id = sid)
+  obj$sample_id <- sid
+
+  obj
+}, seurat_list, names(seurat_list))
+
+per_sample_cells <- vapply(seurat_list, ncol, numeric(1))
+summary(per_sample_cells)
+
+total_cells <- sum(per_sample_cells)
+cat("Total cells after cap:", total_cells, "\n")
+
+seurat_all <- merge(x = seurat_list[[1]], y = seurat_list[-1])
+seurat_all
+
+```
+
+
+```{r}
+target_total_cells <- 100000
+
+if (ncol(seurat_all) > target_total_cells) {
+  keep <- sample(colnames(seurat_all), target_total_cells)
+  seurat_all <- subset(seurat_all, cells = keep)
+}
+
+seurat_all
+cat("Cells after global cap:", ncol(seurat_all), "\n")
+
+```
+
+
+```{r}
+DefaultAssay(seurat_all) <- "RNA"
+
+seurat_all <- JoinLayers(seurat_all, assay = "RNA")
+
+Layers(seurat_all[["RNA"]])
+
+```
+
+
+
+```{r}
+
+seurat_all[["percent.mt"]] <- PercentageFeatureSet(seurat_all, pattern = "^MT-")
+
+VlnPlot(
+seurat_all,
+features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+ncol = 3,
+pt.size = 0.01
+)
+
+min_genes <- 200
+max_genes <- 6000
+max_mt <- 15
+min_cells_per_gene <- 5
+
+seurat_all <- subset(
+seurat_all,
+subset = nFeature_RNA >= min_genes &
+nFeature_RNA <= max_genes &
+percent.mt <= max_mt
+)
+
+counts <- GetAssayData(seurat_all, assay = "RNA", layer = "counts")
+keep_genes <- Matrix::rowSums(counts > 0) >= min_cells_per_gene
+seurat_all <- seurat_all[keep_genes, ]
+
+cat("Cells after QC:", ncol(seurat_all), "\n")
+cat("Genes after gene-cut:", nrow(seurat_all), "\n")
+
+```
+
+
+```{r}
+seurat_all <- NormalizeData(seurat_all)
+seurat_all <- FindVariableFeatures(seurat_all, selection.method = "vst", nfeatures = 5000)
+
+top5k_genes <- VariableFeatures(seurat_all)
+seurat_top5k <- subset(seurat_all, features = top5k_genes)
+
+VariableFeatures(seurat_all) <- top5k_genes
+top1k_genes <- head(top5k_genes, 1000)
+seurat_top1k <- subset(seurat_all, features = top1k_genes)
+
+seurat_top5k
+seurat_top1k
+
+```
+
+############################################################
+# STEP 3 — labeling  
+############################################################
+
+```{r}
+
+ref <- HumanPrimaryCellAtlasData()
+sce <- as.SingleCellExperiment(seurat_top5k)
+
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+seurat_top5k$major_cell_type <- pred$labels
+
+table(seurat_top5k$major_cell_type)[1:20]
+
+```
+
+
+```{r}
+
+seurat_top5k$celltype <- seurat_top5k$major_cell_type
+
+
+min_cells_per_type <- 50
+ct_tab <- table(seurat_top5k$celltype)
+keep_types <- names(ct_tab[ct_tab >= min_cells_per_type])
+
+seurat_top5k$celltype <- ifelse(seurat_top5k$celltype %in% keep_types, seurat_top5k$celltype, "Other")
+seurat_top5k$celltype <- factor(seurat_top5k$celltype)
+
+table(seurat_top5k$celltype)[1:20]
+
+dir.create("ccc_results_r", showWarnings = FALSE)
+saveRDS(seurat_top5k, "ccc_results_r/seurat_top5k_labeled.rds")
+
+```
+
+```{r}
+run_cellchat <- function(seurat_obj, group_col, out_prefix,
+                         max_cells_per_group = 3000, min_cells = 10) {
+
+  stopifnot(group_col %in% colnames(seurat_obj@meta.data))
+
+  Idents(seurat_obj) <- seurat_obj[[group_col, drop = TRUE]]
+  groups <- levels(Idents(seurat_obj))
+
+  cells_use <- unlist(lapply(groups, function(g) {
+    cells <- WhichCells(seurat_obj, idents = g)
+    if (length(cells) > max_cells_per_group) sample(cells, max_cells_per_group) else cells
+  }))
+
+  seurat_ccc <- subset(seurat_obj, cells = cells_use)
+
+  DefaultAssay(seurat_ccc) <- "RNA"
+  seurat_ccc <- JoinLayers(seurat_ccc, assay = "RNA")
+
+  data_input <- GetAssayData(seurat_ccc, assay = "RNA", layer = "data")
+
+  meta <- data.frame(
+    group   = seurat_ccc[[group_col, drop = TRUE]],
+    samples = seurat_ccc$sample_id,
+    row.names = colnames(seurat_ccc)
+  )
+
+  cellchat <- createCellChat(object = data_input, meta = meta, group.by = "group")
+  cellchat@DB <- CellChatDB.human
+
+  cellchat <- subsetData(cellchat)
+
+  cellchat <- identifyOverExpressedGenes(cellchat, do.fast = FALSE)
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+
+  cellchat <- computeCommunProb(cellchat, population.size = TRUE)
+  cellchat <- filterCommunication(cellchat, min.cells = min_cells)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+
+  df_edges <- subsetCommunication(cellchat)
+
+  write.csv(df_edges, paste0("ccc_results_r/", out_prefix, "_edges.csv"), row.names = FALSE)
+  saveRDS(cellchat, paste0("ccc_results_r/", out_prefix, "_cellchat_object.rds"))
+
+  return(list(cellchat = cellchat, edges = df_edges, seurat_used = seurat_ccc))
+}
+
+
+res_celltype <- run_cellchat(
+  seurat_top5k,
+  group_col = "celltype",
+  out_prefix = "cellchat_by_celltype",
+  max_cells_per_group = 3000,
+  min_cells = 10
+)
+
+head(res_celltype$edges)
+
+```
+
+
+
+```{r}
+tumor_meta_path <- "~/Downloads/GSE174554_Tumor_normal_metadata.txt"
+stopifnot(file.exists(tumor_meta_path))
+
+lines <- readLines(tumor_meta_path, warn = FALSE)
+lines <- trimws(lines)
+lines <- lines[nzchar(lines)]
+
+parts <- strsplit(lines, "\\s+")               
+parts <- parts[vapply(parts, length, 1L) >= 2] 
+
+tumor_meta <- data.frame(
+  sample_barcode = vapply(parts, `[[`, character(1), 1),
+  tumor_normal   = vapply(parts, `[[`, character(1), 2),
+  stringsAsFactors = FALSE
+)
+
+tumor_meta <- tumor_meta %>%
+  filter(tolower(sample_barcode) != "sample#_barcode") %>%
+  mutate(
+    sample_barcode = sub("-1$", "", trimws(sample_barcode)),
+    tumor_normal   = trimws(tumor_normal)
+  )
+
+meta <- seurat_top5k@meta.data
+meta$cell_id <- rownames(meta)
+
+meta <- meta %>%
+  mutate(
+    sf_id = ifelse(grepl("SF[0-9]+", sample_id),
+                   sub(".*(SF[0-9]+).*", "\\1", sample_id),
+                   sub(".*(SF[0-9]+).*", "\\1", cell_id)),
+    barcode_only = sub("^.*_", "", cell_id),
+    barcode_only = sub("-1$", "", barcode_only),
+    sample_barcode = paste0(sf_id, "_", barcode_only)
+  )
+
+meta2 <- meta %>% left_join(tumor_meta, by = "sample_barcode")
+
+seurat_top5k$is_tumor <- ifelse(meta2$tumor_normal == "Tumor", "Tumor",
+                         ifelse(meta2$tumor_normal == "Normal", "Normal", "Unknown"))
+seurat_top5k$is_tumor <- factor(seurat_top5k$is_tumor)
+
+print(table(seurat_top5k$is_tumor, useNA = "ifany"))
+
+```
+
+############################################################
+# STEP 4 — building data - first ccc run   
+############################################################
+
+
+```{r}
+seurat_rna <- seurat_top5k  
+
+RESULTS_DIR <- path.expand("~/Downloads/ccc_results_r")
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+cat("Saving results to:", RESULTS_DIR, "\n")
+
+prep_seurat <- function(obj) {
+  DefaultAssay(obj) <- "RNA"
+  obj <- JoinLayers(obj, assay = "RNA")
+  obj
+}
+
+cap_cells_by_group <- function(obj, group_col, max_cells_per_group = 3000, seed = 42) {
+  set.seed(seed)
+  stopifnot(group_col %in% colnames(obj@meta.data))
+  Idents(obj) <- obj[[group_col, drop = TRUE]]
+  groups <- levels(Idents(obj))
+  cells_use <- unlist(lapply(groups, function(g) {
+    cells <- WhichCells(obj, idents = g)
+    if (length(cells) > max_cells_per_group) sample(cells, max_cells_per_group) else cells
+  }))
+  subset(obj, cells = cells_use)
+}
+
+inspect_gene_ids <- function(obj, n = 10) {
+  x <- rownames(obj)
+  cat("\n--- Gene ID debug ---\n")
+  cat("Example rownames:\n"); print(head(x, n))
+  cat("Looks like ENSG?        ", mean(grepl("^ENSG", x)), "\n")
+  cat("Contains ENSG versions? ", mean(grepl("^ENSG.*\\.", x)), "\n")
+  cat("----------------------\n\n")
+}
+
+get_lr_pairs_from_LRdb <- function() {
+  data(LRdb, package = "SingleCellSignalR")
+
+  cat("\n--- LRdb columns (your install) ---\n")
+  print(colnames(LRdb))
+  cat("----------------------------------\n\n")
+
+  cn <- colnames(LRdb)
+
+  ligand_candidates <- c("Ligand.ApprovedSymbol","ligand","Ligand","ligand_gene_symbol",
+                         "Ligand_symbol","ligand_symbol","gene_A","Gene1","from")
+  receptor_candidates <- c("Receptor.ApprovedSymbol","receptor","Receptor","receptor_gene_symbol",
+                           "Receptor_symbol","receptor_symbol","gene_B","Gene2","to")
+
+  lig_col <- ligand_candidates[ligand_candidates %in% cn][1]
+  rec_col <- receptor_candidates[receptor_candidates %in% cn][1]
+
+  if (is.na(lig_col) || is.na(rec_col)) {
+    stop("Could not auto-detect ligand/receptor columns in LRdb. Paste colnames(LRdb) output.")
+  }
+
+  message("Using LRdb columns: ligand = ", lig_col, " | receptor = ", rec_col)
+
+  LRdb %>%
+    dplyr::transmute(ligand = .data[[lig_col]], receptor = .data[[rec_col]]) %>%
+    dplyr::filter(!is.na(ligand), !is.na(receptor)) %>%
+    dplyr::distinct()
+}
+
+run_cellchat <- function(seurat_obj, group_col, out_prefix,
+                         max_cells_per_group = 1200,
+                         min_cells = 10,
+                         seed = 42) {
+
+  seurat_obj <- prep_seurat(seurat_obj)
+
+  grp <- seurat_obj[[group_col, drop = TRUE]]
+  keep_cells <- colnames(seurat_obj)[!is.na(grp)]
+  seurat_obj <- subset(seurat_obj, cells = keep_cells)
+
+  grp <- seurat_obj[[group_col, drop = TRUE]]
+  tab <- table(grp)
+  keep_groups <- names(tab[tab >= min_cells])
+  seurat_obj <- subset(seurat_obj, cells = colnames(seurat_obj)[grp %in% keep_groups])
+
+  seurat_obj <- cap_cells_by_group(seurat_obj, group_col, max_cells_per_group, seed)
+
+  data_input <- GetAssayData(seurat_obj, assay = "RNA", layer = "data")
+
+  meta <- data.frame(
+    group   = as.factor(seurat_obj[[group_col, drop = TRUE]]),
+    samples = as.factor(if ("sample_id" %in% colnames(seurat_obj@meta.data)) seurat_obj$sample_id else "sample1"),
+    row.names = colnames(seurat_obj)
+  )
+
+  cellchat <- createCellChat(object = data_input, meta = meta, group.by = "group")
+  cellchat@DB <- CellChatDB.human
+
+  cellchat <- subsetData(cellchat)
+  cellchat <- identifyOverExpressedGenes(cellchat, do.fast = FALSE)  # avoids presto requirement
+  cellchat <- identifyOverExpressedInteractions(cellchat)
+  cellchat <- computeCommunProb(cellchat, population.size = TRUE)
+  cellchat <- filterCommunication(cellchat, min.cells = min_cells)
+  cellchat <- computeCommunProbPathway(cellchat)
+  cellchat <- aggregateNet(cellchat)
+
+  df_edges <- subsetCommunication(cellchat)
+
+  write.csv(df_edges, file.path(RESULTS_DIR, paste0(out_prefix, "_edges.csv")), row.names = FALSE)
+  saveRDS(cellchat, file.path(RESULTS_DIR, paste0(out_prefix, "_object.rds")))
+
+  df_edges
+}
+
+run_baseline_lrscore <- function(seurat_obj, group_col, out_prefix, top_k_per_lr = 20) {
+  seurat_obj <- prep_seurat(seurat_obj)
+
+  lr <- get_lr_pairs_from_LRdb()
+  avg <- AverageExpression(seurat_obj, assays = "RNA", layer = "data", group.by = group_col)$RNA
+
+  lr <- lr %>% filter(ligand %in% rownames(avg), receptor %in% rownames(avg))
+  message("LR pairs after gene-overlap filtering: ", nrow(lr))
+  if (nrow(lr) == 0) stop("No LR pairs overlap with your expression genes. Check gene symbols.")
+
+  groups <- colnames(avg)
+
+  res_list <- vector("list", nrow(lr))
+  for (i in seq_len(nrow(lr))) {
+    lig <- lr$ligand[i]; rec <- lr$receptor[i]
+    L <- avg[lig, ]; R <- avg[rec, ]
+
+    df <- expand.grid(sender = groups, receiver = groups, stringsAsFactors = FALSE)
+    df$ligand <- lig
+    df$receptor <- rec
+    df$score <- as.numeric(L[df$sender] * R[df$receiver])
+
+    res_list[[i]] <- df %>% arrange(desc(score)) %>% slice_head(n = top_k_per_lr)
+  }
+
+  df_baseline <- bind_rows(res_list) %>% arrange(desc(score))
+  write.csv(df_baseline, file.path(RESULTS_DIR, paste0(out_prefix, "_edges.csv")), row.names = FALSE)
+  df_baseline
+}
+run_scsr <- function(seurat_obj, group_col, out_prefix,
+                     max_cells_per_group = 800,
+                     min_cells_per_group = 25,
+                     seed = 42) {
+
+  seurat_obj <- prep_seurat(seurat_obj)
+  lr <- get_lr_pairs_from_LRdb()
+
+  grp <- seurat_obj[[group_col, drop = TRUE]]
+  keep_cells <- colnames(seurat_obj)[!is.na(grp)]
+  seurat_obj <- subset(seurat_obj, cells = keep_cells)
+
+  grp <- seurat_obj[[group_col, drop = TRUE]]
+  tab <- table(grp)
+  keep_groups <- names(tab[tab >= min_cells_per_group])
+  seurat_obj <- subset(seurat_obj, cells = colnames(seurat_obj)[grp %in% keep_groups])
+
+  seurat_obj <- cap_cells_by_group(seurat_obj, group_col,
+                                   max_cells_per_group = max_cells_per_group,
+                                   seed = seed)
+
+  grp3 <- seurat_obj[[group_col, drop = TRUE]]
+  message("SingleCellSignalR group sizes:")
+  print(sort(table(grp3)))
+
+  counts_sp <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
+
+  lr_genes <- unique(c(lr$ligand, lr$receptor))
+  lr_genes <- lr_genes[!is.na(lr_genes)]
+  genes_keep <- intersect(rownames(counts_sp), lr_genes)
+  message("LR genes kept in matrix: ", length(genes_keep))
+
+  if (length(genes_keep) < 50) {
+    stop("Too few LR genes overlap after filtering (", length(genes_keep),
+         "). Your gene symbols might not match LRdb naming.")
+  }
+
+  counts_sp <- counts_sp[genes_keep, , drop = FALSE]
+  counts_mat <- as.matrix(counts_sp)
+  storage.mode(counts_mat) <- "numeric"
+
+  ct <- seurat_obj[[group_col, drop = TRUE]]
+  cluster_num <- as.integer(factor(ct))
+  cluster_names <- levels(factor(ct))
+
+  outdir <- file.path(RESULTS_DIR, paste0(out_prefix, "_cluster-analysis"))
+  dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+  oldwd <- getwd()
+  setwd(outdir)
+  on.exit(setwd(oldwd), add = TRUE)
+
+  scsr_out <- cell_signaling(
+    data = counts_mat,
+    genes = rownames(counts_mat),
+    cluster = cluster_num,
+    int.type = "paracrine",
+    c.names = cluster_names,
+    species = "homo sapiens",
+    write = TRUE,
+    verbose = TRUE
+  )
+
+  saveRDS(scsr_out, file.path(RESULTS_DIR, paste0(out_prefix, "_object.rds")))
+  return(scsr_out)
+}
+
+inspect_gene_ids(seurat_rna)
+seurat_rna2 <- prep_seurat(seurat_rna)
+
+stopifnot("celltype" %in% colnames(seurat_rna2@meta.data))
+stopifnot("is_tumor" %in% colnames(seurat_rna2@meta.data))
+
+cat("=== snRNA | CellChat | group=celltype ===\n")
+cellchat_celltype <- run_cellchat(seurat_rna2, "celltype", "snRNA_cellchat_by_celltype",
+                                  max_cells_per_group = 1200, min_cells = 10)
+
+cat("=== snRNA | BASELINE | group=celltype ===\n")
+baseline_celltype <- run_baseline_lrscore(seurat_rna2, "celltype", "snRNA_baseline_by_celltype")
+
+cat("=== snRNA | SCSR | group=celltype ===\n")
+scsr_celltype <- run_scsr(seurat_rna2, "celltype", "snRNA_scsr_by_celltype",
+                          max_cells_per_group = 800, min_cells_per_group = 25)
+
+cat("=== snRNA | CellChat | group=is_tumor ===\n")
+cellchat_tumor <- run_cellchat(seurat_rna2, "is_tumor", "snRNA_cellchat_by_tumor",
+                               max_cells_per_group = 4000, min_cells = 20)
+
+cat("=== snRNA | BASELINE | group=is_tumor ===\n")
+baseline_tumor <- run_baseline_lrscore(seurat_rna2, "is_tumor", "snRNA_baseline_by_tumor")
+
+cat("=== snRNA | SCSR | group=is_tumor ===\n")
+scsr_tumor <- run_scsr(seurat_rna2, "is_tumor", "snRNA_scsr_by_tumor",
+                       max_cells_per_group = 2000, min_cells_per_group = 100)
+
+cat("\nDone. Outputs saved in:", RESULTS_DIR, "\n")
+cat("Wrote (CSV):\n",
+    " - snRNA_cellchat_by_celltype_edges.csv\n",
+    " - snRNA_baseline_by_celltype_edges.csv\n",
+    " - snRNA_cellchat_by_tumor_edges.csv\n",
+    " - snRNA_baseline_by_tumor_edges.csv\n")
+cat("Wrote (RDS):\n",
+    " - snRNA_cellchat_by_celltype_object.rds\n",
+    " - snRNA_scsr_by_celltype_object.rds (+ cluster-analysis folder)\n",
+    " - snRNA_cellchat_by_tumor_object.rds\n",
+    " - snRNA_scsr_by_tumor_object.rds (+ cluster-analysis folder)\n")
+
+```
+
+############################################################
+# STEP 5 —  ccc comparing results -    
+############################################################
+
+```{r}
+RESULTS_DIR <- path.expand("~/Downloads/ccc_results_r")
+
+smart_read <- function(f) {
+  ext <- tolower(tools::file_ext(f))
+  df <- tryCatch({
+    if (ext == "csv") readr::read_csv(f, show_col_types = FALSE)
+    else readr::read_tsv(f, show_col_types = FALSE, progress = FALSE)
+  }, error = function(e) NULL)
+
+  if (is.null(df)) df <- tryCatch(readr::read_delim(f, delim = ",", show_col_types = FALSE), error = function(e) NULL)
+  if (is.null(df)) df <- tryCatch(readr::read_delim(f, delim = "\t", show_col_types = FALSE), error = function(e) NULL)
+  df
+}
+
+looks_like_lr_edges <- function(df) {
+  if (!is.data.frame(df) || nrow(df) == 0 || ncol(df) < 4) return(FALSE)
+  cn <- tolower(colnames(df))
+  has_lig  <- any(grepl("ligand|gene.?a", cn))
+  has_rec  <- any(grepl("receptor|gene.?b", cn))
+  has_send <- any(grepl("^from$|sender|source|cluster.?1|group.?1|cell.?1", cn))
+  has_recv <- any(grepl("^to$|receiver|target|cluster.?2|group.?2|cell.?2", cn))
+  has_lig && has_rec && has_send && has_recv
+}
+
+std_scsr <- function(df, grouping_name) {
+  cn <- tolower(colnames(df))
+  pick <- function(regex_vec) {
+    hits <- which(Reduce(`|`, lapply(regex_vec, function(rx) grepl(rx, cn))))
+    if (length(hits) == 0) return(NA_character_)
+    colnames(df)[hits[1]]
+  }
+
+  lig <- pick(c("^ligand$", "ligand", "gene.?a"))
+  rec <- pick(c("^receptor$", "receptor", "gene.?b"))
+  snd <- pick(c("^from$", "sender", "source", "cluster.?1", "group.?1", "cell.?1"))
+  rcv <- pick(c("^to$", "receiver", "target", "cluster.?2", "group.?2", "cell.?2"))
+  sc  <- pick(c("^score$", "score", "weight", "prob", "intensity", "interaction"))
+
+  if (any(is.na(c(lig, rec, snd, rcv)))) {
+    stop("SCSR column mapping failed. Columns were:\n", paste(colnames(df), collapse = ", "))
+  }
+
+  df %>%
+    transmute(
+      sender   = as.character(.data[[snd]]),
+      receiver = as.character(.data[[rcv]]),
+      ligand   = as.character(.data[[lig]]),
+      receptor = as.character(.data[[rec]]),
+      score    = if (!is.na(sc)) suppressWarnings(as.numeric(.data[[sc]])) else NA_real_,
+      method   = "scsr",
+      grouping = grouping_name
+    )
+}
+
+extract_lr_df_from_object <- function(x, depth = 0, max_depth = 6) {
+  if (depth > max_depth) return(NULL)
+
+  if (is.data.frame(x) && looks_like_lr_edges(x)) return(x)
+
+  if (is.list(x)) {
+    for (nm in names(x)) {
+      out <- extract_lr_df_from_object(x[[nm]], depth + 1, max_depth)
+      if (!is.null(out)) return(out)
+    }
+  }
+
+  if (inherits(x, "S4")) {
+    for (sn in methods::slotNames(x)) {
+      out <- extract_lr_df_from_object(methods::slot(x, sn), depth + 1, max_depth)
+      if (!is.null(out)) return(out)
+    }
+  }
+
+  NULL
+}
+
+extract_lr_df_from_results_dir <- function() {
+  files <- list.files(RESULTS_DIR, recursive = TRUE, full.names = TRUE,
+                      pattern = "\\.(csv|tsv|txt)$", ignore.case = TRUE)
+  if (length(files) == 0) return(NULL)
+
+  for (f in files) {
+    df <- smart_read(f)
+    if (!is.null(df) && looks_like_lr_edges(df)) {
+      message("using SCSR edges file found on disk: ", f)
+      return(df)
+    }
+  }
+  NULL
+}
+
+get_scsr_edges <- function(rds_path, grouping_name) {
+  obj <- readRDS(rds_path)
+
+  df <- extract_lr_df_from_object(obj)
+  if (is.null(df)) {
+    message(" No LR edges table found inside RDS: ", basename(rds_path))
+    message("   Trying disk scan under RESULTS_DIR ...")
+    df <- extract_lr_df_from_results_dir()
+  }
+
+  if (is.null(df)) {
+    stop("Could not find any SCSR LR edges table (neither in RDS nor on disk).\n",
+         "This usually means SingleCellSignalR did not output an LR edge table in your run.")
+  }
+
+  std_scsr(df, grouping_name)
+}
+
+scsr_celltype_std <- get_scsr_edges(
+  file.path(RESULTS_DIR, "snRNA_scsr_by_celltype_object.rds"),
+  "celltype"
+)
+
+scsr_tumor_std <- get_scsr_edges(
+  file.path(RESULTS_DIR, "snRNA_scsr_by_tumor_object.rds"),
+  "tumor"
+)
+
+head(scsr_celltype_std)
+head(scsr_tumor_std)
+```
+
+############################################################
+# STEP 6 —  benshmarking 
+############################################################
+
+```{r}
+RESULTS_DIR <- path.expand("~/Downloads/ccc_results_r")
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+std_cellchat <- function(df, grouping, modality) {
+  cn <- tolower(colnames(df))
+  pick <- function(opts) {
+    hit <- opts[opts %in% cn][1]
+    if (is.na(hit)) stop("Missing column among: ", paste(opts, collapse=", "))
+    colnames(df)[match(hit, cn)]
+  }
+  lig <- pick(c("ligand","ligand_name"))
+  rec <- pick(c("receptor","receptor_name"))
+  snd <- pick(c("source","sender"))
+  rcv <- pick(c("target","receiver"))
+  sc  <- pick(c("prob","communication_probability","score"))
+
+  df %>%
+    transmute(
+      sender   = as.character(.data[[snd]]),
+      receiver = as.character(.data[[rcv]]),
+      ligand   = as.character(.data[[lig]]),
+      receptor = as.character(.data[[rec]]),
+      score    = as.numeric(.data[[sc]]),
+      method   = "cellchat",
+      grouping = grouping,
+      modality = modality,
+      pair     = paste(ligand, receptor, sep="|")
+    )
+}
+
+std_baseline <- function(df, grouping, modality) {
+  df %>%
+    transmute(
+      sender, receiver, ligand, receptor,
+      score    = as.numeric(score),
+      method   = "baseline",
+      grouping = grouping,
+      modality = modality,
+      pair     = paste(ligand, receptor, sep="|")
+    )
+}
+
+cc_celltype   <- read_csv(file.path(RESULTS_DIR, "snRNA_cellchat_by_celltype_edges.csv"), show_col_types = FALSE)
+cc_tumor      <- read_csv(file.path(RESULTS_DIR, "snRNA_cellchat_by_tumor_edges.csv"),    show_col_types = FALSE)
+
+base_celltype <- read_csv(file.path(RESULTS_DIR, "snRNA_baseline_by_celltype_edges.csv"), show_col_types = FALSE)
+base_tumor    <- read_csv(file.path(RESULTS_DIR, "snRNA_baseline_by_tumor_edges.csv"),    show_col_types = FALSE)
+
+edges_all <- bind_rows(
+  std_cellchat(cc_celltype,   "celltype", "snRNA"),
+  std_cellchat(cc_tumor,      "tumor",    "snRNA"),
+  std_baseline(base_celltype, "celltype", "snRNA"),
+  std_baseline(base_tumor,    "tumor",    "snRNA")
+)
+
+
+pair_counts <- edges_all %>%
+  group_by(modality, grouping, method) %>%
+  summarise(n_pairs = n_distinct(pair), n_edges = n(), .groups="drop") %>%
+  arrange(modality, grouping, desc(n_pairs))
+
+write_csv(pair_counts, file.path(RESULTS_DIR, "bench_pair_counts_v2.csv"))
+
+jaccard <- function(a, b) length(intersect(a,b)) / length(union(a,b))
+
+consensus <- edges_all %>%
+  group_by(modality, grouping, method) %>%
+  summarise(pairs = list(unique(pair)), .groups="drop") %>%
+  tidyr::pivot_wider(names_from = method, values_from = pairs) %>%
+  mutate(
+    jaccard_cellchat_baseline = ifelse(!is.na(cellchat) & !is.na(baseline),
+                                       mapply(jaccard, cellchat, baseline),
+                                       NA_real_)
+  ) %>%
+  select(modality, grouping, jaccard_cellchat_baseline)
+
+write_csv(consensus, file.path(RESULTS_DIR, "bench_consensus_jaccard.csv"))
+
+seurat_sp <- NULL 
+
+get_spatial_coords <- function(seurat_sp) {
+  if (length(seurat_sp@images) > 0) {
+    coords <- Seurat::GetTissueCoordinates(seurat_sp)
+    return(as.matrix(coords[, c("x","y"), drop=FALSE]))
+  }
+  md <- seurat_sp@meta.data
+  if (all(c("x","y") %in% colnames(md))) return(as.matrix(md[, c("x","y")]))
+  if (all(c("imagerow","imagecol") %in% colnames(md))) return(as.matrix(md[, c("imagecol","imagerow")]))
+  stop("No spatial coordinates found (need images or x/y or imagerow/imagecol in meta.data).")
+}
+
+compute_group_proximity <- function(coords, groups, k = 6) {
+  if (!requireNamespace("RANN", quietly = TRUE)) install.packages("RANN")
+  nn <- RANN::nn2(coords, k = k + 1)
+  idx <- nn$nn.idx[, -1, drop = FALSE]
+  dst <- nn$nn.dists[, -1, drop = FALSE]
+  w <- 1 / (1 + dst)
+
+  groups <- factor(groups)
+  lev <- levels(groups)
+  g_idx <- as.integer(groups)
+
+  W <- matrix(0, nrow=length(lev), ncol=length(lev), dimnames=list(lev, lev))
+  for (i in seq_len(nrow(idx))) {
+    gi <- g_idx[i]
+    js <- idx[i, ]
+    gj <- g_idx[js]
+    W[gi, gj] <- W[gi, gj] + sum(w[i, ])
+  }
+  if (sum(W) > 0) W <- W / sum(W)
+  W
+}
+
+score_edges_by_proximity <- function(edges_df, prox_mat) {
+  edges_df %>%
+    mutate(
+      prox = ifelse(sender %in% rownames(prox_mat) & receiver %in% colnames(prox_mat),
+                    prox_mat[sender, receiver],
+                    NA_real_)
+    )
+}
+
+if (!is.null(seurat_sp)) {
+  message("Running spatial benefit test...")
+
+  stopifnot("celltype" %in% colnames(seurat_sp@meta.data))
+  stopifnot("is_tumor" %in% colnames(seurat_sp@meta.data))
+
+  coords <- get_spatial_coords(seurat_sp)
+
+  prox_celltype <- compute_group_proximity(coords, seurat_sp$celltype, k=6)
+  prox_tumor    <- compute_group_proximity(coords, seurat_sp$is_tumor,  k=6)
+
+  edges_spval <- bind_rows(
+    score_edges_by_proximity(edges_all %>% filter(grouping=="celltype"), prox_celltype),
+    score_edges_by_proximity(edges_all %>% filter(grouping=="tumor"),    prox_tumor)
+  )
+
+  spatial_benefit <- edges_spval %>%
+    group_by(grouping, method) %>%
+    summarise(
+      mean_prox_top200 = mean(sort(prox, decreasing=TRUE)[1:min(200, sum(!is.na(prox)))], na.rm=TRUE),
+      frac_edges_with_prox = mean(!is.na(prox)),
+      .groups="drop"
+    ) %>%
+    arrange(grouping, desc(mean_prox_top200))
+
+  write_csv(spatial_benefit, file.path(RESULTS_DIR, "bench_spatial_benefit.csv"))
+
+  print(spatial_benefit)
+} else {
+  message("NOTE: seurat_sp is NULL, so spatial benefit test was skipped.")
+}
+
+best_summary <- pair_counts %>%
+  left_join(consensus, by=c("modality","grouping")) %>%
+  filter(modality=="snRNA") %>%
+  arrange(grouping, desc(n_pairs))
+
+write_csv(best_summary, file.path(RESULTS_DIR, "bench_best_summary_snRNA.csv"))
+print(best_summary)
+
+cat("\nStep 7 complete. Wrote:\n",
+    " - bench_pair_counts_v2.csv\n",
+    " - bench_consensus_jaccard.csv\n",
+    " - bench_best_summary_snRNA.csv\n",
+    if (!is.null(seurat_sp)) " - bench_spatial_benefit.csv\n" else "",
+    "in: ", RESULTS_DIR, "\n", sep="")
+
+```
+
+
+############################################################
+# STEP 7 —  add spatial data to the mix  
+############################################################
+
+
+```{r}
+RESULTS_DIR <- path.expand("~/Downloads/ccc_results_r")
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+prep_seurat <- function(obj) {
+  DefaultAssay(obj) <- "RNA"
+  obj <- JoinLayers(obj, assay = "RNA")
+  obj
+}
+
+cap_cells_by_group <- function(obj, group_col, max_cells_per_group = 2000, seed = 42) {
+  set.seed(seed)
+  Idents(obj) <- obj[[group_col, drop = TRUE]]
+  groups <- levels(Idents(obj))
+  cells_use <- unlist(lapply(groups, function(g) {
+    cells <- WhichCells(obj, idents = g)
+    if (length(cells) > max_cells_per_group) sample(cells, max_cells_per_group) else cells
+  }))
+  subset(obj, cells = cells_use)
+}
+
+get_lr_pairs_from_LRdb <- function() {
+  data(LRdb, package = "SingleCellSignalR")
+  cn <- colnames(LRdb)
+
+  ligand_candidates <- c("Ligand.ApprovedSymbol","ligand","Ligand","gene_A","Gene1","from")
+  receptor_candidates <- c("Receptor.ApprovedSymbol","receptor","Receptor","gene_B","Gene2","to")
+
+  lig_col <- ligand_candidates[ligand_candidates %in% cn][1]
+  rec_col <- receptor_candidates[receptor_candidates %in% cn][1]
+
+  if (is.na(lig_col) || is.na(rec_col)) {
+    stop("Could not auto-detect ligand/receptor columns in LRdb. Columns are:\n",
+         paste(cn, collapse=", "))
+  }
+
+  LRdb %>%
+    transmute(ligand = .data[[lig_col]], receptor = .data[[rec_col]]) %>%
+    filter(!is.na(ligand), !is.na(receptor)) %>%
+    distinct()
+}
+
+run_scsrproxy <- function(seurat_obj, group_col, out_prefix,
+                          max_cells_per_group = 2000,
+                          min_cells_per_group = 25,
+                          top_k_per_lr = 20,
+                          seed = 42) {
+
+  seurat_obj <- prep_seurat(seurat_obj)
+
+  grp <- seurat_obj[[group_col, drop = TRUE]]
+  seurat_obj <- subset(seurat_obj, cells = colnames(seurat_obj)[!is.na(grp)])
+
+  grp <- seurat_obj[[group_col, drop = TRUE]]
+  tab <- table(grp)
+  keep_groups <- names(tab[tab >= min_cells_per_group])
+  seurat_obj <- subset(seurat_obj, cells = colnames(seurat_obj)[grp %in% keep_groups])
+
+  seurat_obj <- cap_cells_by_group(seurat_obj, group_col, max_cells_per_group, seed)
+
+  lr <- get_lr_pairs_from_LRdb()
+
+  avg <- AverageExpression(seurat_obj, assays = "RNA", layer = "data", group.by = group_col)$RNA
+
+  lr <- lr %>% filter(ligand %in% rownames(avg), receptor %in% rownames(avg))
+  message(out_prefix, " | LR pairs after overlap: ", nrow(lr))
+  if (nrow(lr) == 0) stop("No LR pairs overlap. Gene symbols mismatch with LRdb.")
+
+  groups <- colnames(avg)
+
+  res_list <- vector("list", nrow(lr))
+  for (i in seq_len(nrow(lr))) {
+    lig <- lr$ligand[i]; rec <- lr$receptor[i]
+    L <- avg[lig, ]; R <- avg[rec, ]
+
+    df <- expand.grid(sender = groups, receiver = groups, stringsAsFactors = FALSE)
+    df$ligand <- lig
+    df$receptor <- rec
+    df$score <- as.numeric(L[df$sender] * R[df$receiver])
+
+    res_list[[i]] <- df %>% arrange(desc(score)) %>% slice_head(n = top_k_per_lr)
+  }
+
+  edges <- bind_rows(res_list) %>%
+    mutate(method = "scsrproxy", grouping = group_col) %>%
+    arrange(desc(score))
+
+  out_csv <- file.path(RESULTS_DIR, paste0(out_prefix, "_edges.csv"))
+  write_csv(edges, out_csv)
+  message(" Wrote: ", out_csv)
+  edges
+}
+
+seurat_rna <- seurat_top5k
+
+stopifnot("celltype" %in% colnames(seurat_rna@meta.data))
+stopifnot("is_tumor" %in% colnames(seurat_rna@meta.data))
+
+scsrp_celltype <- run_scsrproxy(seurat_rna, "celltype", "snRNA_scsrproxy_by_celltype",
+                                max_cells_per_group = 800, min_cells_per_group = 25)
+
+scsrp_tumor <- run_scsrproxy(seurat_rna, "is_tumor", "snRNA_scsrproxy_by_tumor",
+                             max_cells_per_group = 5000, min_cells_per_group = 100)
+
+cat("\nDone. SCSR-proxy edges created in:", RESULTS_DIR, "\n")
+
+
+```
+
+############################################################
+# STEP 8 —  run spatial data ccc  
+############################################################
+
+```{r}
+
+RESULTS_DIR <- path.expand("~/Downloads/ccc_results_r")
+
+find_col <- function(df, patterns) {
+  nms <- colnames(df)
+  low <- tolower(nms)
+  for (p in patterns) {
+    hit <- which(grepl(p, low))
+    if (length(hit) > 0) return(nms[hit[1]])
+  }
+  NA_character_
+}
+
+read_edges <- function(path) {
+  df <- readr::read_csv(path, show_col_types = FALSE)
+
+  sender_col   <- find_col(df, c("^sender$", "^source$", "^from$"))
+  receiver_col <- find_col(df, c("^receiver$", "^target$", "^to$"))
+  ligand_col   <- find_col(df, c("^ligand$", "ligand"))
+  receptor_col <- find_col(df, c("^receptor$", "receptor"))
+  score_col    <- find_col(df, c("^score$", "^prob$", "weight", "communication_probability", "interaction_strength"))
+
+  if (is.na(sender_col) || is.na(receiver_col) || is.na(ligand_col) || is.na(receptor_col)) {
+    stop("Missing required columns in: ", basename(path), "\n",
+         "Columns present: ", paste(colnames(df), collapse = ", "))
+  }
+
+  score_vec <- if (!is.na(score_col)) suppressWarnings(as.numeric(df[[score_col]])) else rep(NA_real_, nrow(df))
+
+  tibble(
+    sender   = as.character(df[[sender_col]]),
+    receiver = as.character(df[[receiver_col]]),
+    ligand   = as.character(df[[ligand_col]]),
+    receptor = as.character(df[[receptor_col]]),
+    score    = score_vec
+  ) %>%
+    filter(!is.na(sender), !is.na(receiver), !is.na(ligand), !is.na(receptor)) %>%
+    mutate(
+      lr_pair = paste(ligand, receptor, sep="|"),
+      edge_id = paste(sender, receiver, ligand, receptor, sep="|")
+    )
+}
+
+files <- tibble::tribble(
+  ~method,     ~grouping,  ~file,
+  "cellchat",  "celltype", "snRNA_cellchat_by_celltype_edges.csv",
+  "baseline",  "celltype", "snRNA_baseline_by_celltype_edges.csv",
+  "scsrproxy", "celltype", "snRNA_scsrproxy_by_celltype_edges.csv",
+  "cellchat",  "tumor",    "snRNA_cellchat_by_tumor_edges.csv",
+  "baseline",  "tumor",    "snRNA_baseline_by_tumor_edges.csv",
+  "scsrproxy", "tumor",    "snRNA_scsrproxy_by_tumor_edges.csv"
+) %>%
+  mutate(path = file.path(RESULTS_DIR, file))
+
+# sanity: warn if missing
+missing_files <- files %>% filter(!file.exists(path))
+if (nrow(missing_files) > 0) {
+  print(missing_files)
+  stop("Some input CSV files are missing in RESULTS_DIR.")
+}
+
+edges_all <- files %>%
+  rowwise() %>%
+  mutate(df = list(read_edges(path))) %>%
+  ungroup() %>%
+  select(method, grouping, df) %>%
+  tidyr::unnest(df)
+
+bench_counts <- edges_all %>%
+  group_by(grouping, method) %>%
+  summarise(
+    n_edges = n_distinct(edge_id),
+    n_pairs = n_distinct(lr_pair),
+    .groups = "drop"
+  ) %>%
+  arrange(grouping, desc(n_pairs))
+
+write_csv(bench_counts, file.path(RESULTS_DIR, "bench_all_counts.csv"))
+
+# FIG 1: pair counts
+p1 <- ggplot(bench_counts, aes(x = method, y = n_pairs)) +
+  geom_col() +
+  facet_wrap(~grouping, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  labs(title = "CCC coverage: unique ligand–receptor pairs", y = "Unique LR pairs", x = NULL)
+ggsave(file.path(RESULTS_DIR, "fig1_counts_pairs.png"), p1, width = 9, height = 4.5)
+
+p2 <- ggplot(bench_counts, aes(x = method, y = n_edges)) +
+  geom_col() +
+  facet_wrap(~grouping, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  labs(title = "CCC output size: directed edges (sender→receiver per LR)", y = "Unique edges", x = NULL)
+ggsave(file.path(RESULTS_DIR, "fig2_counts_edges.png"), p2, width = 9, height = 4.5)
+
+jaccard <- function(a, b) {
+  a <- unique(a); b <- unique(b)
+  if (length(a) == 0 && length(b) == 0) return(1)
+  length(intersect(a, b)) / length(union(a, b))
+}
+
+pairs_by <- edges_all %>%
+  group_by(grouping, method) %>%
+  summarise(pairs = list(unique(lr_pair)), .groups="drop")
+
+pair_jacc <- pairs_by %>%
+  group_by(grouping) %>%
+  group_modify(~{
+    mm <- .x$method
+    out <- list()
+    for (i in seq_along(mm)) for (j in seq_along(mm)) {
+      out[[length(out)+1]] <- tibble(
+        method_A = mm[i],
+        method_B = mm[j],
+        jaccard_pairs = jaccard(.x$pairs[[i]], .x$pairs[[j]])
+      )
+    }
+    bind_rows(out)
+  }) %>%
+  ungroup()
+
+write_csv(pair_jacc, file.path(RESULTS_DIR, "bench_all_jaccard_pairs.csv"))
+
+plot_heat <- function(df, value_col, title, outpath) {
+  p <- ggplot(df, aes(x = method_A, y = method_B, fill = .data[[value_col]])) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.3f", .data[[value_col]])), size = 4) +
+    facet_wrap(~grouping) +
+    theme_minimal(base_size = 12) +
+    labs(title = title, x = NULL, y = NULL)
+  ggsave(outpath, p, width = 9, height = 4.5)
+}
+
+# FIG 3-4: pair jaccard heatmaps by grouping
+plot_heat(pair_jacc %>% filter(grouping=="celltype"),
+          "jaccard_pairs",
+          "Agreement on LR pairs (Jaccard) — celltype grouping",
+          file.path(RESULTS_DIR, "fig3_pair_jaccard_heatmap_celltype.png"))
+
+plot_heat(pair_jacc %>% filter(grouping=="tumor"),
+          "jaccard_pairs",
+          "Agreement on LR pairs (Jaccard) — tumor vs normal grouping",
+          file.path(RESULTS_DIR, "fig4_pair_jaccard_heatmap_tumor.png"))
+
+topN <- 500
+
+top_edges <- edges_all %>%
+  group_by(grouping, method) %>%
+  mutate(score_rank = ifelse(is.na(score), -Inf, score)) %>%
+  arrange(desc(score_rank)) %>%
+  slice_head(n = topN) %>%
+  summarise(top = list(unique(edge_id)), .groups="drop")
+
+top_jacc <- top_edges %>%
+  group_by(grouping) %>%
+  group_modify(~{
+    mm <- .x$method
+    out <- list()
+    for (i in seq_along(mm)) for (j in seq_along(mm)) {
+      out[[length(out)+1]] <- tibble(
+        method_A = mm[i],
+        method_B = mm[j],
+        jaccard_top_edges = jaccard(.x$top[[i]], .x$top[[j]])
+      )
+    }
+    bind_rows(out)
+  }) %>%
+  ungroup()
+
+write_csv(top_jacc, file.path(RESULTS_DIR, "bench_all_jaccard_top_edges.csv"))
+
+plot_heat(top_jacc %>% filter(grouping=="celltype"),
+          "jaccard_top_edges",
+          paste0("Agreement on TOP ", topN, " edges (Jaccard) — celltype grouping"),
+          file.path(RESULTS_DIR, "fig5_topedge_jaccard_heatmap_celltype.png"))
+
+plot_heat(top_jacc %>% filter(grouping=="tumor"),
+          "jaccard_top_edges",
+          paste0("Agreement on TOP ", topN, " edges (Jaccard) — tumor vs normal grouping"),
+          file.path(RESULTS_DIR, "fig6_topedge_jaccard_heatmap_tumor.png"))
+
+consensus <- pair_jacc %>%
+  filter(method_A != method_B) %>%
+  group_by(grouping, method = method_A) %>%
+  summarise(consensus_pairs = mean(jaccard_pairs), .groups="drop") %>%
+  left_join(
+    top_jacc %>%
+      filter(method_A != method_B) %>%
+      group_by(grouping, method = method_A) %>%
+      summarise(consensus_top_edges = mean(jaccard_top_edges), .groups="drop"),
+    by = c("grouping","method")
+  ) %>%
+  left_join(bench_counts, by = c("grouping","method")) %>%
+  mutate(consensus_overall = 0.5*consensus_pairs + 0.5*consensus_top_edges) %>%
+  arrange(grouping, desc(consensus_overall))
+
+write_csv(consensus, file.path(RESULTS_DIR, "bench_all_consensus_summary.csv"))
+
+plot_top_pairs <- function(grouping_name, outpath) {
+  df <- edges_all %>%
+    filter(grouping == grouping_name) %>%
+    group_by(method, lr_pair) %>%
+    summarise(score_sum = sum(score, na.rm = TRUE), .groups="drop") %>%
+    group_by(method) %>%
+    arrange(desc(score_sum)) %>%
+    slice_head(n = 15) %>%
+    ungroup() %>%
+    mutate(lr_pair = str_replace_all(lr_pair, "\\|", "→"))
+
+  p <- ggplot(df, aes(x = reorder(lr_pair, score_sum), y = score_sum)) +
+    geom_col() +
+    coord_flip() +
+    facet_wrap(~method, scales = "free_y") +
+    theme_minimal(base_size = 11) +
+    labs(title = paste0("Top 15 LR pairs by aggregated score — ", grouping_name),
+         x = NULL, y = "Sum(score) (within method)")
+
+  ggsave(outpath, p, width = 10, height = 6)
+}
+
+plot_top_pairs("celltype", file.path(RESULTS_DIR, "fig7_top_pairs_barplot_celltype.png"))
+plot_top_pairs("tumor",    file.path(RESULTS_DIR, "fig8_top_pairs_barplot_tumor.png"))
+
+cat("Step 7 complete. Outputs saved in:\n  ", RESULTS_DIR, "\n\n", sep="")
+cat("Wrote:\n",
+    " - bench_all_counts.csv\n",
+    " - bench_all_consensus_summary.csv\n",
+    " - fig1_counts_pairs.png\n",
+    " - fig2_counts_edges.png\n",
+    " - fig3_pair_jaccard_heatmap_celltype.png\n",
+    " - fig4_pair_jaccard_heatmap_tumor.png\n",
+    " - fig5_topedge_jaccard_heatmap_celltype.png\n",
+    " - fig6_topedge_jaccard_heatmap_tumor.png\n",
+    " - fig7_top_pairs_barplot_celltype.png\n",
+    " - fig8_top_pairs_barplot_tumor.png\n")
+
+print(consensus)
+
+```
+
+
+```{r}
+
+build_spatial_from_expr_txt <- function(expr_path,
+                                       project = "GSE174554_spatial",
+                                       min_features = 0,
+                                       min_cells = 0,
+                                       make_fake_coords = TRUE) {
+  expr_path <- path.expand(expr_path)
+  stopifnot(file.exists(expr_path))
+
+  header_line <- readLines(expr_path, n = 1, warn = FALSE)
+  spots <- gsub('"', "", unlist(strsplit(trimws(header_line), "\\s+")))
+  spots <- spots[spots != ""]
+  if (length(spots) < 2) stop("Could not parse spot IDs from first line.")
+
+  lines <- readLines(expr_path, skipNul = TRUE, warn = FALSE)
+  lines <- lines[-1]
+  lines <- lines[trimws(lines) != ""]
+  
+  parse_row <- function(ln) {
+    toks <- gsub('"', "", unlist(strsplit(trimws(ln), "\\s+")))
+    if (length(toks) < 2) return(NULL)
+    gene <- toks[1]
+    vals <- suppressWarnings(as.numeric(toks[-1]))
+    if (anyNA(vals)) {
+      vals <- suppressWarnings(as.numeric(gsub(",", "", toks[-1])))
+    }
+    if (length(vals) != length(spots)) {
+      return(NULL)
+    }
+    list(gene = gene, vals = vals)
+  }
+
+  parsed <- lapply(lines, parse_row)
+  parsed <- parsed[!vapply(parsed, is.null, logical(1))]
+  if (length(parsed) == 0) stop("Parsed 0 gene rows. Check file format.")
+
+  genes <- vapply(parsed, `[[`, character(1), "gene")
+  mat   <- do.call(rbind, lapply(parsed, `[[`, "vals"))
+
+  rownames(mat) <- genes
+  colnames(mat) <- spots
+
+  mat_sp <- Matrix(mat, sparse = TRUE)
+
+  obj <- CreateSeuratObject(mat_sp, project = project,
+                            min.cells = min_cells, min.features = min_features)
+  DefaultAssay(obj) <- "RNA"
+
+
+  obj$sample_id <- sub("_[^_]+$", "", colnames(obj))
+
+  if (make_fake_coords) {
+    n <- ncol(obj)
+    side <- ceiling(sqrt(n))
+    xy <- expand.grid(x = seq_len(side), y = seq_len(side))[seq_len(n), ]
+    rownames(xy) <- colnames(obj)
+    obj@meta.data$x <- xy$x
+    obj@meta.data$y <- xy$y
+  }
+
+  obj
+}
+
+SPATIAL_EXPR_PATH <- "~/Downloads/GSE174554_Spatial_transcriptomic_matrix.txt"  # <-- change if needed
+
+seurat_sp <- build_spatial_from_expr_txt(SPATIAL_EXPR_PATH)
+seurat_sp
+table(seurat_sp$sample_id)[1:10]
+head(seurat_sp@meta.data[, c("x","y","sample_id")])
+
+```
+
+############################################################
+# STEP 9 —  benshmarking spatial data ccc  
+############################################################
+
+```{r}
+
+RESULTS_DIR <- path.expand("~/Downloads/ccc_results_r")
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+SPATIAL_EXPR_PATH <- path.expand("~/Downloads/GSE174554_Spatial_transcriptomic_matrix.txt")  # <-- change if needed
+TUMOR_META_PATH   <- path.expand("~/Downloads/GSE174554_Tumor_normal_metadata.txt")         # you said this exists
+
+cat("RESULTS_DIR:", RESULTS_DIR, "\n")
+cat("SPATIAL_EXPR_PATH:", SPATIAL_EXPR_PATH, "\n")
+cat("UMOR_META_PATH:", TUMOR_META_PATH, "\n\n")
+
+build_spatial_from_expr_txt <- function(expr_path,
+                                       project = "GSE174554_spatial",
+                                       min_features = 0,
+                                       min_cells = 0,
+                                       make_fake_coords = TRUE) {
+  expr_path <- path.expand(expr_path)
+  stopifnot(file.exists(expr_path))
+
+  header_line <- readLines(expr_path, n = 1, warn = FALSE)
+  spots <- gsub('"', "", unlist(strsplit(trimws(header_line), "\\s+")))
+  spots <- spots[spots != ""]
+  if (length(spots) < 2) stop("Could not parse spot IDs from first line.")
+
+  lines <- readLines(expr_path, skipNul = TRUE, warn = FALSE)
+  lines <- lines[-1]
+  lines <- lines[trimws(lines) != ""]
+
+  parse_row <- function(ln) {
+    toks <- gsub('"', "", unlist(strsplit(trimws(ln), "\\s+")))
+    if (length(toks) < 2) return(NULL)
+    gene <- toks[1]
+    vals <- suppressWarnings(as.numeric(toks[-1]))
+    if (anyNA(vals)) vals <- suppressWarnings(as.numeric(gsub(",", "", toks[-1])))
+    if (length(vals) != length(spots)) return(NULL)
+    list(gene = gene, vals = vals)
+  }
+
+  parsed <- lapply(lines, parse_row)
+  parsed <- parsed[!vapply(parsed, is.null, logical(1))]
+  if (length(parsed) == 0) stop("Parsed 0 gene rows. Check file format.")
+
+  genes <- vapply(parsed, `[[`, character(1), "gene")
+  mat   <- do.call(rbind, lapply(parsed, `[[`, "vals"))
+  rownames(mat) <- genes
+  colnames(mat) <- spots
+
+  mat_sp <- Matrix(mat, sparse = TRUE)
+
+  obj <- CreateSeuratObject(mat_sp, project = project,
+                            min.cells = min_cells, min.features = min_features)
+  DefaultAssay(obj) <- "RNA"
+
+  obj$sample_id <- sub("_[^_]+$", "", colnames(obj))
+
+  if (make_fake_coords) {
+    n <- ncol(obj)
+    side <- ceiling(sqrt(n))
+    xy <- expand.grid(x = seq_len(side), y = seq_len(side))[seq_len(n), ]
+    rownames(xy) <- colnames(obj)
+    obj@meta.data$x <- xy$x
+    obj@meta.data$y <- xy$y
+  }
+
+  obj
+}
+
+seurat_sp <- build_spatial_from_expr_txt(SPATIAL_EXPR_PATH)
+cat("Built seurat_sp:\n")
+print(seurat_sp)
+cat("\nSpatial sample_id table (first 10):\n")
+print(head(sort(table(seurat_sp$sample_id), decreasing = TRUE), 10))
+```
+
+```{r}
+RESULTS_DIR <- path.expand("/Users/yassenarab/Downloads/ccc_results_r")
+
+find_col <- function(df, patterns) {
+  nms <- colnames(df)
+  low <- tolower(nms)
+  for (p in patterns) {
+    hit <- which(grepl(p, low))
+    if (length(hit) > 0) return(nms[hit[1]])
+  }
+  NA_character_
+}
+
+read_edges <- function(path) {
+  df <- read_csv(path, show_col_types = FALSE)
+
+  sender_col   <- find_col(df, c("^sender$", "^source$", "^from$"))
+  receiver_col <- find_col(df, c("^receiver$", "^target$", "^to$"))
+  ligand_col   <- find_col(df, c("^ligand$"))
+  receptor_col <- find_col(df, c("^receptor$"))
+  score_col    <- find_col(df, c("^score$", "^prob$", "weight"))
+
+  score_vec <- if (!is.na(score_col))
+    suppressWarnings(as.numeric(df[[score_col]]))
+  else
+    rep(NA_real_, nrow(df))
+
+  tibble(
+    sender   = as.character(df[[sender_col]]),
+    receiver = as.character(df[[receiver_col]]),
+    ligand   = as.character(df[[ligand_col]]),
+    receptor = as.character(df[[receptor_col]]),
+    score    = score_vec
+  ) %>%
+    mutate(
+      lr_pair = paste(ligand, receptor, sep="|"),
+      edge_id = paste(sender, receiver, ligand, receptor, sep="|")
+    )
+}
+
+safe_jaccard <- function(a, b) {
+  if (length(a)==0 || length(b)==0) return(NA_real_)
+  length(intersect(a,b)) / length(union(a,b))
+}
+
+files <- tribble(
+  ~modality, ~method,    ~grouping,  ~file,
+  "snRNA",   "cellchat", "celltype", "snRNA_cellchat_by_celltype_edges.csv",
+  "snRNA",   "baseline", "celltype", "snRNA_baseline_by_celltype_edges.csv",
+  "snRNA",   "cellchat", "tumor",    "snRNA_cellchat_by_tumor_edges.csv",
+  "snRNA",   "baseline", "tumor",    "snRNA_baseline_by_tumor_edges.csv",
+
+  "spatial", "cellchat", "celltype", "spatial_cellchat_by_celltype_edges.csv",
+  "spatial", "baseline", "celltype", "spatial_baseline_by_celltype_edges.csv"
+) %>%
+  mutate(path = file.path(RESULTS_DIR, file)) %>%
+  filter(file.exists(path))
+
+edges_all <- files %>%
+  rowwise() %>%
+  mutate(df = list(read_edges(path))) %>%
+  ungroup() %>%
+  tidyr::unnest(df)
+
+bench_counts <- edges_all %>%
+  group_by(modality, grouping, method) %>%
+  summarise(
+    n_pairs = n_distinct(lr_pair),
+    n_edges = n_distinct(edge_id),
+    .groups = "drop"
+  )
+
+write_csv(bench_counts,
+          file.path(RESULTS_DIR, "bench_spatial_vs_snRNA_counts.csv"))
+
+p1 <- ggplot(bench_counts, aes(method, n_pairs, fill = modality)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~grouping) +
+  theme_minimal() +
+  labs(title = "Unique Ligand–Receptor Pairs: Spatial vs snRNA")
+
+ggsave(file.path(RESULTS_DIR,
+       "fig_spatial_vs_snRNA_pairs.png"), p1, width=10, height=5)
+
+p2 <- ggplot(bench_counts, aes(method, n_edges, fill = modality)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~grouping) +
+  theme_minimal() +
+  labs(title = "CCC Edges: Spatial vs snRNA")
+
+ggsave(file.path(RESULTS_DIR,
+       "fig_spatial_vs_snRNA_edges.png"), p2, width=10, height=5)
+
+pairs_by <- edges_all %>%
+  group_by(modality, grouping, method) %>%
+  summarise(pairs = list(unique(lr_pair)), .groups="drop")
+
+pair_jacc <- pairs_by %>%
+  group_by(grouping, method) %>%
+  summarise(
+    spatial_vs_snRNA =
+      safe_jaccard(
+        pairs[modality=="spatial"],
+        pairs[modality=="snRNA"]
+      ),
+    .groups="drop"
+  )
+
+write_csv(pair_jacc,
+          file.path(RESULTS_DIR,
+                    "bench_spatial_vs_snRNA_pair_jaccard.csv"))
+
+p3 <- ggplot(pair_jacc,
+             aes(method, grouping,
+                 fill = spatial_vs_snRNA)) +
+  geom_tile(color="white") +
+  geom_text(aes(label=sprintf("%.3f", spatial_vs_snRNA)), size=5) +
+  scale_fill_gradient(low="white", high="red", na.value="grey90") +
+  theme_minimal() +
+  labs(title="Spatial vs snRNA Pair Agreement (Jaccard)")
+
+ggsave(file.path(RESULTS_DIR,
+       "fig_spatial_vs_snRNA_jaccard.png"), p3, width=8, height=4)
+
+cat(" SAFE SPATIAL BENCHMARK COMPLETE")
+
+print(bench_counts)
+print(pair_jacc)
+```
+
